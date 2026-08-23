@@ -1,9 +1,13 @@
 # watershed
 
 A TLS-terminating TCP proxy. It decrypts client traffic, looks at the first
-bytes to decide whether the stream is HTTP or something else, and forwards the
-connection to one of two configured backends — each independently reachable over
-plain TCP or TLS (optionally with a client certificate).
+bytes to decide where the stream belongs, and forwards the connection to a
+backend — each backend independently reachable over plain TCP or TLS, optionally
+with a client certificate.
+
+Non-HTTP streams go to a single generic backend. HTTP streams can be routed by
+**rules** on path, method, host and headers, so several services can sit behind
+one TLS endpoint.
 
 After the routing decision the proxy is a transparent byte pipe: it never
 rewrites, buffers or interprets payload.
@@ -14,9 +18,9 @@ rewrites, buffers or interprets payload.
 client --TLS--> [ watershed ] --plain or TLS--> backend
                     |
                     +-- 1. terminate client TLS
-                    +-- 2. peek at the first bytes (bounded by size and time)
-                    +-- 3. HTTP request line?  -> BACKEND_HTTP_*
-                    |      anything else       -> BACKEND_TCP_*
+                    +-- 2. peek at the head of the stream (bounded by size and time)
+                    +-- 3. not HTTP?  -> BACKEND_TCP_*
+                    |      HTTP?      -> first matching rule, else BACKEND_HTTP_*
                     +-- 4. splice both directions until either side finishes
 ```
 
@@ -24,7 +28,19 @@ The peek is bounded two ways. `MAX_INSPECT_BYTES` caps how much is buffered, and
 `INSPECT_TIMEOUT` caps how long watershed waits for it. Crucially the proxy does
 **not** wait for the buffer to fill: a 40-byte request is classified as soon as
 it arrives, so a client that sends a short request and waits for a reply is
-never stalled. Every peeked byte is replayed to the backend verbatim.
+never stalled. For HTTP the peek continues to the end of the header block — no
+further — so rules can match on headers while the body still streams straight
+through. Every peeked byte is replayed to the backend verbatim.
+
+### One decision per connection
+
+Routing happens once, when the connection opens. After that watershed is a raw
+tunnel and cannot re-read the stream, so with HTTP keep-alive a second request
+on the same connection goes wherever the **first** one went.
+
+This is inherent to proxying at the TCP layer. If you need per-request routing,
+you need a full HTTP proxy that parses and re-emits every request — a different
+program with different costs.
 
 ## Configuration
 
@@ -63,6 +79,63 @@ for everything else. Both accept the same variables.
 TLS-only variables are ignored when `TYPE=plain`, so a half-edited environment
 cannot silently change transports. Any invalid value is reported as a startup
 error; the proxy never panics on configuration.
+
+These two are also addressable by name from rules, as `http` and `tcp`.
+
+## Rule-based HTTP routing
+
+Set `ROUTES_FILE` to a JSON file to declare extra backends and the rules that
+select them. Without it watershed behaves exactly as described above.
+
+```json
+{
+  "backends": {
+    "api":    { "addr": "127.0.0.1:9001" },
+    "cdn":    { "addr": "cdn.internal:8443", "type": "tls", "caCertFile": "/etc/ssl/ca.pem" },
+    "canary": { "addr": "127.0.0.1:9003" }
+  },
+  "rules": [
+    { "name": "canary",  "backend": "canary", "headers": [{ "name": "X-Canary", "equals": "1" }] },
+    { "name": "writes",  "backend": "api",    "methods": ["POST", "PUT", "PATCH", "DELETE"] },
+    { "name": "api",     "backend": "api",    "path": { "prefix": "/api/" } },
+    { "name": "assets",  "backend": "cdn",    "path": { "suffix": ".js" } },
+    { "name": "by-host", "backend": "cdn",    "host": { "equals": "static.example.com" } }
+  ]
+}
+```
+
+**Evaluation.** Rules are tried in order and the first match wins, so put the
+specific ones first. Within one rule every stated condition must hold — a rule
+is an AND of its conditions. A request matching nothing falls through to
+`BACKEND_HTTP_*`.
+
+**Conditions.** A rule may combine any of:
+
+| Field | Matches against |
+| --- | --- |
+| `methods` | the request method, upper case, any of the listed values |
+| `path` | the request target with the query string stripped |
+| `host` | the `Host` header with the port stripped |
+| `headers` | a named header; repeated headers match if any value does |
+
+`path`, `host` and each header take exactly one comparison: `equals`, `prefix`,
+`suffix` or `regex` (RE2). A header may instead use `"exists": true` to match on
+presence alone.
+
+**Backends** declared in the file take `addr` (required), `type`, `caCertFile`,
+`clientCertFile`, `clientKeyFile` and `insecureSkipVerify` — the same knobs the
+environment offers. A name colliding with `http` or `tcp` is rejected.
+
+**Everything is validated at startup**: an unknown backend, a bad regex, a rule
+with no conditions, two comparisons in one match, or an unknown JSON field all
+stop the proxy from starting. A typo must not become a routing surprise on one
+unlucky request.
+
+Two limits worth knowing. Header rules only see headers that arrived within
+`MAX_INSPECT_BYTES`; a header block larger than that is matched on whatever was
+read, which can turn into a false negative — raise the budget if you route on
+headers that sit far down a large request. And routing is per connection, not
+per request: see the note above about keep-alive.
 
 ## Running
 

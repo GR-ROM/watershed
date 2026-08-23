@@ -5,6 +5,7 @@ package main
 import (
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -45,11 +46,24 @@ func run(logger *log.Logger) error {
 		return err
 	}
 
-	srv := proxy.New(cfg, logger)
+	srv, err := proxy.New(cfg, logger)
+	if err != nil {
+		return err
+	}
 
 	logger.Printf("listening on %s", ln.Addr())
 	logger.Printf("http  backend: %s (%s)", cfg.HTTPBackend.Addr, cfg.HTTPBackend.Transport)
 	logger.Printf("tcp   backend: %s (%s)", cfg.TCPBackend.Addr, cfg.TCPBackend.Transport)
+	if len(cfg.Rules) > 0 {
+		logger.Printf("routes: %d rule(s) from %s", len(cfg.Rules), cfg.RoutesFile)
+		for i, r := range cfg.Rules {
+			name := r.Name
+			if name == "" {
+				name = fmt.Sprintf("#%d", i)
+			}
+			logger.Printf("  rule %s -> %s", name, r.Backend)
+		}
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()

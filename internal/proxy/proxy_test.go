@@ -131,7 +131,10 @@ func startProxy(t *testing.T, cfg *config.Config) string {
 		t.Fatal(err)
 	}
 
-	srv := New(cfg, log.New(io.Discard, "", 0))
+	srv, err := New(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() { _ = srv.Serve(ln) }()
 
 	t.Cleanup(func() {
@@ -353,7 +356,10 @@ func TestShutdownReleasesConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv := New(cfg, log.New(io.Discard, "", 0))
+	srv, err := New(cfg, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()
 

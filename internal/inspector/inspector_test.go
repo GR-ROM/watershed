@@ -92,12 +92,12 @@ func TestPeekShortPayloadDoesNotBlock(t *testing.T) {
 
 	done := make(chan struct{})
 	var (
-		proto Protocol
-		err   error
+		res Result
+		err error
 	)
 	go func() {
 		defer close(done)
-		_, proto, err = Peek(server, 4096, 2*time.Second)
+		_, res, err = Peek(server, 4096, 2*time.Second)
 	}()
 
 	select {
@@ -109,8 +109,8 @@ func TestPeekShortPayloadDoesNotBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Peek: %v", err)
 	}
-	if proto != ProtocolHTTP {
-		t.Fatalf("proto = %v, want %v", proto, ProtocolHTTP)
+	if res.Protocol != ProtocolHTTP {
+		t.Fatalf("proto = %v, want %v", res.Protocol, ProtocolHTTP)
 	}
 }
 
@@ -130,12 +130,12 @@ func TestPeekReplaysEveryByte(t *testing.T) {
 		}
 	}()
 
-	conn, proto, err := Peek(server, 64, time.Second)
+	conn, res, err := Peek(server, 64, time.Second)
 	if err != nil {
 		t.Fatalf("Peek: %v", err)
 	}
-	if proto != ProtocolHTTP {
-		t.Fatalf("proto = %v, want HTTP", proto)
+	if res.Protocol != ProtocolHTTP {
+		t.Fatalf("proto = %v, want HTTP", res.Protocol)
 	}
 
 	got, err := io.ReadAll(conn)
@@ -157,12 +157,12 @@ func TestPeekBinaryRoutesToTCP(t *testing.T) {
 	payload := []byte{0x16, 0x03, 0x01, 0x00, 0x2f} // looks like a TLS record
 	go func() { _, _ = client.Write(payload) }()
 
-	conn, proto, err := Peek(server, 8, time.Second)
+	conn, res, err := Peek(server, 8, time.Second)
 	if err != nil {
 		t.Fatalf("Peek: %v", err)
 	}
-	if proto != ProtocolTCP {
-		t.Fatalf("proto = %v, want TCP", proto)
+	if res.Protocol != ProtocolTCP {
+		t.Fatalf("proto = %v, want TCP", res.Protocol)
 	}
 
 	buf := make([]byte, len(payload))

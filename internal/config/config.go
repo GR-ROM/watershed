@@ -2,12 +2,16 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"watershed/internal/router"
 )
 
 // Transport selects how the proxy connects to a backend.
@@ -21,13 +25,16 @@ const (
 )
 
 // Backend describes one downstream target and how to reach it.
+//
+// The json tags serve the optional routes file, which may declare extra named
+// backends beyond the two the environment configures.
 type Backend struct {
-	Transport          Transport
-	Addr               string
-	CACertFile         string
-	ClientCertFile     string
-	ClientKeyFile      string
-	InsecureSkipVerify bool
+	Transport          Transport `json:"type,omitempty"`
+	Addr               string    `json:"addr"`
+	CACertFile         string    `json:"caCertFile,omitempty"`
+	ClientCertFile     string    `json:"clientCertFile,omitempty"`
+	ClientKeyFile      string    `json:"clientKeyFile,omitempty"`
+	InsecureSkipVerify bool      `json:"insecureSkipVerify,omitempty"`
 }
 
 // UsesClientCert reports whether a client certificate was configured for mTLS.
@@ -50,8 +57,32 @@ type Config struct {
 	// DialTimeout bounds establishing the backend connection.
 	DialTimeout time.Duration
 
+	// HTTPBackend is where HTTP connections go when no rule matches, and
+	// TCPBackend is where everything non-HTTP goes. Both are always present.
 	HTTPBackend Backend
 	TCPBackend  Backend
+
+	// Backends holds every backend by name, including the two above under
+	// DefaultHTTPBackendName and DefaultTCPBackendName, plus any declared in the
+	// routes file. Rules address backends through this map.
+	Backends map[string]Backend
+	// Rules are evaluated in order for HTTP connections; the first match wins.
+	// Empty means the proxy behaves exactly as it did before rules existed.
+	Rules []router.Rule
+	// RoutesFile records where the rules came from, for logging.
+	RoutesFile string
+}
+
+// Names under which the environment-configured backends are registered.
+const (
+	DefaultHTTPBackendName = "http"
+	DefaultTCPBackendName  = "tcp"
+)
+
+// routesFile is the on-disk shape of ROUTES_FILE.
+type routesFile struct {
+	Backends map[string]Backend `json:"backends"`
+	Rules    []router.Rule      `json:"rules"`
 }
 
 // Defaults applied when the corresponding variable is unset or empty.
@@ -99,7 +130,76 @@ func LoadFromEnv() (*Config, error) {
 		return nil, err
 	}
 
+	cfg.Backends = map[string]Backend{
+		DefaultHTTPBackendName: cfg.HTTPBackend,
+		DefaultTCPBackendName:  cfg.TCPBackend,
+	}
+
+	cfg.RoutesFile = os.Getenv("ROUTES_FILE")
+	if cfg.RoutesFile != "" {
+		if err := cfg.loadRoutes(cfg.RoutesFile); err != nil {
+			return nil, err
+		}
+	}
+
 	return cfg, nil
+}
+
+// loadRoutes merges the routes file into cfg: extra named backends and the
+// ordered rule list. Everything is validated here so a bad file fails at
+// startup rather than on the first matching request.
+func (cfg *Config) loadRoutes(path string) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("ROUTES_FILE: %w", err)
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields() // a typo in a rule must not be silently ignored
+
+	var rf routesFile
+	if err := dec.Decode(&rf); err != nil {
+		return fmt.Errorf("ROUTES_FILE %s: %w", path, err)
+	}
+
+	for name, b := range rf.Backends {
+		if name == "" {
+			return fmt.Errorf("ROUTES_FILE %s: a backend has an empty name", path)
+		}
+		if b.Addr == "" {
+			return fmt.Errorf("ROUTES_FILE %s: backend %q has no addr", path, name)
+		}
+		if b.Transport == "" {
+			b.Transport = TransportPlain
+		}
+		switch b.Transport {
+		case TransportPlain, TransportTLS:
+		default:
+			return fmt.Errorf("ROUTES_FILE %s: backend %q has type %q, want %q or %q",
+				path, name, b.Transport, TransportPlain, TransportTLS)
+		}
+		if (b.ClientCertFile == "") != (b.ClientKeyFile == "") {
+			return fmt.Errorf("ROUTES_FILE %s: backend %q must set clientCertFile and clientKeyFile together",
+				path, name)
+		}
+		if _, taken := cfg.Backends[name]; taken {
+			return fmt.Errorf("ROUTES_FILE %s: backend %q collides with the environment-configured one",
+				path, name)
+		}
+		cfg.Backends[name] = b
+	}
+
+	// Compile the rules purely to validate them; the proxy builds its own
+	// Router from cfg.Rules at startup.
+	if _, err := router.New(rf.Rules, func(name string) bool {
+		_, ok := cfg.Backends[name]
+		return ok
+	}); err != nil {
+		return fmt.Errorf("ROUTES_FILE %s: %w", path, err)
+	}
+
+	cfg.Rules = rf.Rules
+	return nil
 }
 
 // loadBackend reads one BACKEND_<NAME>_* group.

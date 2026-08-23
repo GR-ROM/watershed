@@ -13,6 +13,7 @@ import (
 	"watershed/internal/config"
 	"watershed/internal/dialer"
 	"watershed/internal/inspector"
+	"watershed/internal/router"
 )
 
 // halfCloser is implemented by *net.TCPConn and *tls.Conn. Using it lets the
@@ -25,8 +26,9 @@ type halfCloser interface {
 
 // Server proxies accepted connections to the configured backends.
 type Server struct {
-	cfg *config.Config
-	log *log.Logger
+	cfg    *config.Config
+	log    *log.Logger
+	router *router.Router
 
 	mu      sync.Mutex
 	conns   map[net.Conn]struct{}
@@ -36,15 +38,29 @@ type Server struct {
 }
 
 // New returns a Server. A nil logger discards output.
-func New(cfg *config.Config, logger *log.Logger) *Server {
+//
+// It fails when the rule set is invalid — an unknown backend or a malformed
+// pattern is a configuration error, and it must surface at startup rather than
+// on the first request that happens to hit the broken rule.
+func New(cfg *config.Config, logger *log.Logger) (*Server, error) {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	return &Server{
-		cfg:   cfg,
-		log:   logger,
-		conns: make(map[net.Conn]struct{}),
+
+	rt, err := router.New(cfg.Rules, func(name string) bool {
+		_, ok := cfg.Backends[name]
+		return ok
+	})
+	if err != nil {
+		return nil, err
 	}
+
+	return &Server{
+		cfg:    cfg,
+		log:    logger,
+		router: rt,
+		conns:  make(map[net.Conn]struct{}),
+	}, nil
 }
 
 // Serve accepts connections until ln is closed. It always returns a non-nil
@@ -78,7 +94,7 @@ func (s *Server) Serve(ln net.Listener) error {
 func (s *Server) handle(client net.Conn) {
 	defer client.Close()
 
-	peeked, proto, err := inspector.Peek(client, s.cfg.MaxInspectBytes, s.cfg.InspectTimeout)
+	peeked, res, err := inspector.Peek(client, s.cfg.MaxInspectBytes, s.cfg.InspectTimeout)
 	if err != nil {
 		if !errors.Is(err, io.EOF) {
 			s.log.Printf("inspect %s: %v", client.RemoteAddr(), err)
@@ -86,20 +102,45 @@ func (s *Server) handle(client net.Conn) {
 		return
 	}
 
-	backend := s.cfg.TCPBackend
-	if proto == inspector.ProtocolHTTP {
-		backend = s.cfg.HTTPBackend
-	}
+	name, backend := s.pick(res)
 
 	upstream, err := dialer.Dial(backend, s.cfg.DialTimeout)
 	if err != nil {
-		s.log.Printf("route %s -> %s (%s): %v", client.RemoteAddr(), backend.Addr, proto, err)
+		s.log.Printf("route %s -> %s (%s): %v", client.RemoteAddr(), name, res.Protocol, err)
 		return
 	}
 	defer upstream.Close()
 
-	s.log.Printf("route %s -> %s (%s/%s)", client.RemoteAddr(), backend.Addr, proto, backend.Transport)
+	s.log.Printf("route %s -> %s %s (%s/%s)",
+		client.RemoteAddr(), name, backend.Addr, res.Protocol, backend.Transport)
 	Splice(peeked, upstream)
+}
+
+// pick resolves a peek result to a named backend.
+//
+// Non-HTTP always goes to the TCP backend: rules describe HTTP requests and
+// have nothing to match against a raw stream. For HTTP the rules decide, and
+// the HTTP backend is the fallback when none applies.
+func (s *Server) pick(res inspector.Result) (string, config.Backend) {
+	if res.Protocol != inspector.ProtocolHTTP || res.Request == nil {
+		return config.DefaultTCPBackendName, s.cfg.TCPBackend
+	}
+
+	req := router.Request{
+		Method: res.Request.Method,
+		Path:   res.Request.Path,
+		Host:   res.Request.Host,
+		Header: res.Request.Header,
+	}
+	if name, ok := s.router.Match(req); ok {
+		if b, exists := s.cfg.Backends[name]; exists {
+			return name, b
+		}
+		// New() rejects unknown backends, so this is unreachable in practice;
+		// falling back beats dropping the connection if it ever happens.
+		s.log.Printf("rule matched unknown backend %q, using the default", name)
+	}
+	return config.DefaultHTTPBackendName, s.cfg.HTTPBackend
 }
 
 // Splice copies bytes in both directions until either side finishes, then
