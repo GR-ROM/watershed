@@ -88,6 +88,31 @@ func Detect(prefix []byte) Protocol {
 	return ProtocolHTTP
 }
 
+// couldBeHTTP reports whether prefix might still become an HTTP request line.
+//
+// True while the bytes are a partial method token ("GE"), or a whole one ("GET ").
+// False the moment they are neither, which for a binary protocol is usually the
+// first byte -- and that is the point: without it, a stream carrying no newline
+// is only classified when the read deadline fires, so every connection that is
+// not HTTP pays the whole INSPECT_TIMEOUT before a byte reaches its backend.
+func couldBeHTTP(prefix []byte) bool {
+	if len(prefix) == 0 {
+		return true
+	}
+	for _, m := range httpMethods {
+		if len(prefix) < len(m) {
+			if bytes.HasPrefix(m, prefix) {
+				return true
+			}
+			continue
+		}
+		if bytes.HasPrefix(prefix, m) {
+			return true
+		}
+	}
+	return false
+}
+
 func matchMethod(prefix []byte) int {
 	for _, m := range httpMethods {
 		if bytes.HasPrefix(prefix, m) {
@@ -145,6 +170,15 @@ func Peek(conn net.Conn, maxBytes int, timeout time.Duration) (*Conn, Result, er
 		n, err := conn.Read(chunk[:maxBytes-len(buf)])
 		if n > 0 {
 			buf = append(buf, chunk[:n]...)
+
+			// Ruled out as HTTP: decide now rather than waiting for a newline that a
+			// binary protocol has no reason to send.
+			if !classed && !couldBeHTTP(buf) {
+				proto = ProtocolTCP
+				classed = true
+				complete = true
+				break
+			}
 
 			if !classed && bytes.IndexByte(buf, '\n') >= 0 {
 				proto = Detect(buf)
