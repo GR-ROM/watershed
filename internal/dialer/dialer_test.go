@@ -72,7 +72,7 @@ func TestDialPlain(t *testing.T) {
 		}
 	}()
 
-	conn, err := Dial(config.Backend{Transport: config.TransportPlain, Addr: ln.Addr().String()}, time.Second)
+	conn, err := Dial(config.Backend{Transport: config.TransportPlain, Addr: ln.Addr().String()}, time.Second, nil, nil)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestDialTLSVerifiesAgainstCABundle(t *testing.T) {
 			Transport:  config.TransportTLS,
 			Addr:       ln.Addr().String(),
 			CACertFile: certPath,
-		}, 2*time.Second)
+		}, 2*time.Second, nil, nil)
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}
@@ -137,7 +137,7 @@ func TestDialTLSVerifiesAgainstCABundle(t *testing.T) {
 		_, err := Dial(config.Backend{
 			Transport: config.TransportTLS,
 			Addr:      ln.Addr().String(),
-		}, 2*time.Second)
+		}, 2*time.Second, nil, nil)
 		if err == nil {
 			t.Fatal("expected verification to fail without the CA bundle")
 		}
@@ -148,7 +148,7 @@ func TestDialTLSVerifiesAgainstCABundle(t *testing.T) {
 			Transport:          config.TransportTLS,
 			Addr:               ln.Addr().String(),
 			InsecureSkipVerify: true,
-		}, 2*time.Second)
+		}, 2*time.Second, nil, nil)
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}
@@ -202,7 +202,7 @@ func TestTLSConfigErrors(t *testing.T) {
 }
 
 func TestDialUnsupportedTransport(t *testing.T) {
-	if _, err := Dial(config.Backend{Transport: "quic", Addr: "127.0.0.1:1"}, time.Second); err == nil {
+	if _, err := Dial(config.Backend{Transport: "quic", Addr: "127.0.0.1:1"}, time.Second, nil, nil); err == nil {
 		t.Fatal("expected an error for an unsupported transport")
 	}
 }

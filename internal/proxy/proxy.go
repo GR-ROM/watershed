@@ -104,7 +104,7 @@ func (s *Server) handle(client net.Conn) {
 
 	name, backend := s.pick(res)
 
-	upstream, err := dialer.Dial(backend, s.cfg.DialTimeout)
+	upstream, err := dialer.Dial(backend, s.cfg.DialTimeout, client.RemoteAddr(), client.LocalAddr())
 	if err != nil {
 		s.log.Printf("route %s -> %s (%s): %v", client.RemoteAddr(), name, res.Protocol, err)
 		return

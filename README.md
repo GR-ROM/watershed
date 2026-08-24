@@ -83,6 +83,12 @@ for everything else. Both accept the same variables.
 | `BACKEND_<X>_CLIENT_CERT_FILE` | — | Client certificate for mTLS |
 | `BACKEND_<X>_CLIENT_KEY_FILE` | — | Matching key; must be set together with the cert |
 | `BACKEND_<X>_TLS_INSECURE_SKIP_VERIFY` | `false` | Skip verification — development only |
+| `BACKEND_<X>_SEND_PROXY` | — | `v2` prepends a PROXY protocol v2 header so the backend learns the client's real address |
+
+`SEND_PROXY` is written on the raw TCP connection **before** any TLS handshake, because that is where
+a receiver has to read it: it decides whether to talk to this client at all before spending a
+handshake on them. A backend that does not expect a header will refuse the connection — read as a
+frame length the signature is 218 762 506 — so it is opt-in per backend and off by default.
 
 TLS-only variables are ignored when `TYPE=plain`, so a half-edited environment
 cannot silently change transports. Any invalid value is reported as a startup
