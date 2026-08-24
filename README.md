@@ -28,7 +28,15 @@ The peek is bounded two ways. `MAX_INSPECT_BYTES` caps how much is buffered, and
 `INSPECT_TIMEOUT` caps how long watershed waits for it. Crucially the proxy does
 **not** wait for the buffer to fill: a 40-byte request is classified as soon as
 it arrives, so a client that sends a short request and waits for a reply is
-never stalled. For HTTP the peek continues to the end of the header block — no
+never stalled.
+
+That holds for binary protocols too, and used to not: until 2026-08-23 the
+classifier only ran once a newline appeared in the buffer, so a stream that
+never sends one was held until `INSPECT_TIMEOUT` fired. Every non-HTTP
+connection paid it in full -- measured through a real proxy at 5266 ms to the
+first protocol reply against 614 ms direct. A prefix that cannot still become an
+HTTP request line is now decided on the spot, which for a binary protocol is
+usually the first byte. For HTTP the peek continues to the end of the header block — no
 further — so rules can match on headers while the body still streams straight
 through. Every peeked byte is replayed to the backend verbatim.
 
@@ -75,6 +83,12 @@ for everything else. Both accept the same variables.
 | `BACKEND_<X>_CLIENT_CERT_FILE` | — | Client certificate for mTLS |
 | `BACKEND_<X>_CLIENT_KEY_FILE` | — | Matching key; must be set together with the cert |
 | `BACKEND_<X>_TLS_INSECURE_SKIP_VERIFY` | `false` | Skip verification — development only |
+| `BACKEND_<X>_SEND_PROXY` | — | `v2` prepends a PROXY protocol v2 header so the backend learns the client's real address |
+
+`SEND_PROXY` is written on the raw TCP connection **before** any TLS handshake, because that is where
+a receiver has to read it: it decides whether to talk to this client at all before spending a
+handshake on them. A backend that does not expect a header will refuse the connection — read as a
+frame length the signature is 218 762 506 — so it is opt-in per backend and off by default.
 
 TLS-only variables are ignored when `TYPE=plain`, so a half-edited environment
 cannot silently change transports. Any invalid value is reported as a startup

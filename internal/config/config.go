@@ -35,6 +35,14 @@ type Backend struct {
 	ClientCertFile     string    `json:"clientCertFile,omitempty"`
 	ClientKeyFile      string    `json:"clientKeyFile,omitempty"`
 	InsecureSkipVerify bool      `json:"insecureSkipVerify,omitempty"`
+	// SendProxy writes a PROXY protocol v2 header before anything else, so the backend learns which
+	// client the connection belongs to instead of seeing this proxy for every one of them.
+	//
+	// Written on the raw TCP connection, before any TLS handshake, because that is where a receiver
+	// has to read it: it must know who is connecting before it decides whether to talk to them at
+	// all. A backend that does not expect one will refuse the connection -- the signature read as a
+	// frame length is 218 762 506 -- so this is opt-in per backend and off by default.
+	SendProxy bool `json:"sendProxy,omitempty"`
 }
 
 // UsesClientCert reports whether a client certificate was configured for mTLS.
@@ -214,6 +222,15 @@ func loadBackend(prefix string) (Backend, error) {
 
 	if b.Addr == "" {
 		return Backend{}, fmt.Errorf("%s_ADDR is required", prefix)
+	}
+
+	switch strings.ToLower(envOr(prefix+"_SEND_PROXY", "")) {
+	case "", "off", "false", "none":
+	case "v2":
+		b.SendProxy = true
+	default:
+		return Backend{}, fmt.Errorf("%s_SEND_PROXY must be %q or unset, got %q",
+			prefix, "v2", os.Getenv(prefix+"_SEND_PROXY"))
 	}
 
 	switch b.Transport {

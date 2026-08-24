@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -20,11 +21,36 @@ import (
 const shutdownGrace = 15 * time.Second
 
 func main() {
-	logger := log.New(os.Stderr, "watershed ", log.LstdFlags|log.Lmsgprefix)
+	out, closeOut, err := logDestination()
+	if err != nil {
+		log.Fatalf("watershed fatal: %v", err)
+	}
+	defer closeOut()
+
+	logger := log.New(out, "watershed ", log.LstdFlags|log.Lmsgprefix)
 
 	if err := run(logger); err != nil {
 		logger.Fatalf("fatal: %v", err)
 	}
+}
+
+// logDestination returns where the log goes: stderr, and additionally a file when LOG_FILE is set.
+//
+// The file exists for log readers that are not a person -- fail2ban tails one to ban an address that
+// floods the listener, and it needs a path that survives a redeploy. A container's json log does not:
+// it lives under the container id, so recreating the container moves it and the jail silently stops
+// watching anything. Rotation is logrotate's job and must use copytruncate: the file is held open for
+// the life of the process, so a rename would leave this writing to an unlinked inode.
+func logDestination() (io.Writer, func(), error) {
+	path := os.Getenv("LOG_FILE")
+	if path == "" {
+		return os.Stderr, func() {}, nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+	if err != nil {
+		return nil, nil, fmt.Errorf("LOG_FILE %s: %w", path, err)
+	}
+	return io.MultiWriter(os.Stderr, f), func() { f.Close() }, nil
 }
 
 func run(logger *log.Logger) error {
