@@ -13,6 +13,7 @@ import (
 	"watershed/internal/config"
 	"watershed/internal/dialer"
 	"watershed/internal/inspector"
+	"watershed/internal/metrics"
 	"watershed/internal/router"
 )
 
@@ -94,22 +95,30 @@ func (s *Server) Serve(ln net.Listener) error {
 func (s *Server) handle(client net.Conn) {
 	defer client.Close()
 
+	metrics.ConnectionOpened()
+	defer metrics.ConnectionClosed()
+
+	inspectStart := time.Now()
 	peeked, res, err := inspector.Peek(client, s.cfg.MaxInspectBytes, s.cfg.InspectTimeout)
 	if err != nil {
+		metrics.InspectFailed()
 		if !errors.Is(err, io.EOF) {
 			s.log.Printf("inspect %s: %v", client.RemoteAddr(), err)
 		}
 		return
 	}
+	metrics.Inspected(time.Since(inspectStart))
 
 	name, backend := s.pick(res)
 
 	upstream, err := dialer.Dial(backend, s.cfg.DialTimeout, client.RemoteAddr(), client.LocalAddr())
 	if err != nil {
+		metrics.DialFailed()
 		s.log.Printf("route %s -> %s (%s): %v", client.RemoteAddr(), name, res.Protocol, err)
 		return
 	}
 	defer upstream.Close()
+	metrics.Routed(res.Protocol.String())
 
 	s.log.Printf("route %s -> %s %s (%s/%s)",
 		client.RemoteAddr(), name, backend.Addr, res.Protocol, backend.Transport)
@@ -150,11 +159,12 @@ func Splice(a, b net.Conn) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		copyThenHalfClose(b, a)
+		// a is the client side, b the backend: this half carries the client's bytes upstream.
+		metrics.Upstream(copyThenHalfClose(b, a))
 	}()
 	go func() {
 		defer wg.Done()
-		copyThenHalfClose(a, b)
+		metrics.Downstream(copyThenHalfClose(a, b))
 	}()
 	wg.Wait()
 }
@@ -162,21 +172,22 @@ func Splice(a, b net.Conn) {
 // copyThenHalfClose streams src into dst and signals end-of-stream to dst.
 // If dst cannot half-close it is closed outright, which unblocks the peer
 // goroutine instead of leaking it.
-func copyThenHalfClose(dst, src net.Conn) {
-	_, _ = io.Copy(dst, src)
+func copyThenHalfClose(dst, src net.Conn) int64 {
+	n, _ := io.Copy(dst, src)
 
 	if hc, ok := dst.(halfCloser); ok {
 		_ = hc.CloseWrite()
-		return
+		return n
 	}
 	// inspector.Conn wraps the real connection; unwrap one level before giving up.
 	if ic, ok := dst.(*inspector.Conn); ok {
 		if hc, ok := ic.Conn.(halfCloser); ok {
 			_ = hc.CloseWrite()
-			return
+			return n
 		}
 	}
 	_ = dst.Close()
+	return n
 }
 
 // Shutdown stops accepting, closes live connections and waits for the handlers

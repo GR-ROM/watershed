@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"watershed/internal/config"
+	"watershed/internal/metrics"
 	"watershed/internal/proxyproto"
 )
 
@@ -37,6 +38,7 @@ func Dial(b config.Backend, timeout time.Duration, client, dialled net.Addr) (ne
 			raw.Close()
 			return nil, fmt.Errorf("announce %s: %w", b.Addr, err)
 		}
+		metrics.ProxyHeaderSent()
 	}
 
 	if b.Transport == config.TransportPlain {

@@ -62,6 +62,23 @@ All settings come from the environment.
 | `TLS_CERT_FILE` | — | **Required.** Server certificate presented to clients |
 | `TLS_KEY_FILE` | — | **Required.** Matching private key |
 
+### Observability
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `METRICS_LISTEN_ADDR` | — | Serves Prometheus metrics at `/metrics` on this address; unset means no endpoint |
+
+**Do not make it public.** The proxy's job is to look like an ordinary web server from outside, and an
+endpoint answering `watershed_connections_total` undoes that in one request. Bind it to loopback or a
+private network and let the scraper reach it there. A failure to bind is logged and not fatal: losing
+metrics is worth a line in the log, taking down a proxy that every client goes through is not.
+
+Two of the series are worth knowing about. `watershed_inspect_wait_seconds_total` over
+`watershed_inspect_total` is the mean time to classify a connection — a bug once held every non-HTTP
+connection for the whole `INSPECT_TIMEOUT` and the only symptom was that clients felt slow; this ratio
+says it in one glance. And `watershed_connection_errors_total` is split by stage, because "the proxy
+is failing" is not actionable while "it cannot dial the backend" is.
+
 ### Inspection and timeouts
 
 | Variable | Default | Meaning |

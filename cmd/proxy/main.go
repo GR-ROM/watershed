@@ -14,7 +14,10 @@ import (
 	"syscall"
 	"time"
 
+	"net/http"
+
 	"watershed/internal/config"
+	"watershed/internal/metrics"
 	"watershed/internal/proxy"
 )
 
@@ -32,6 +35,35 @@ func main() {
 	if err := run(logger); err != nil {
 		logger.Fatalf("fatal: %v", err)
 	}
+}
+
+// startMetrics serves the Prometheus endpoint on its own listener, in the background.
+//
+// A separate address on purpose, and one that should not be public: the proxy's whole job is to look
+// like an ordinary web server from outside, and an endpoint announcing "watershed_connections_total"
+// undoes that in one request. Bind it to loopback or a private network and let the scraper reach it
+// there.
+//
+// A failure to bind is logged and not fatal. Losing metrics is worth a line in the log; taking the
+// proxy down over them is not, and this process is in the path of every client.
+func startMetrics(addr string, logger *log.Logger) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		metrics.WriteTo(w)
+	})
+
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		logger.Printf("metrics on %s/metrics", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Printf("metrics listener stopped: %v", err)
+		}
+	}()
 }
 
 // logDestination returns where the log goes: stderr, and additionally a file when LOG_FILE is set.
@@ -75,6 +107,10 @@ func run(logger *log.Logger) error {
 	srv, err := proxy.New(cfg, logger)
 	if err != nil {
 		return err
+	}
+
+	if addr := os.Getenv("METRICS_LISTEN_ADDR"); addr != "" {
+		startMetrics(addr, logger)
 	}
 
 	logger.Printf("listening on %s", ln.Addr())
