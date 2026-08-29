@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"watershed/internal/backend"
@@ -36,6 +37,8 @@ type Server struct {
 	// tracks the connections that can be moved when it does.
 	backends *backend.Holder
 	sessions *registry
+	// migrationFailures counts clients dropped because their new backend could not be dialled.
+	migrationFailures atomic.Uint64
 
 	mu      sync.Mutex
 	conns   map[net.Conn]struct{}
@@ -151,6 +154,7 @@ func (s *Server) handle(client net.Conn) {
 		log:      s.log,
 		connID:   s.sessions.nextConnID(),
 		target:   target,
+		failures: &s.migrationFailures,
 	}
 	sess.generation.Store(target.Generation)
 	s.sessions.add(sess)

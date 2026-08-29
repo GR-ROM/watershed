@@ -100,3 +100,16 @@ func TestAnOversizedTLVIsDroppedNotTruncated(t *testing.T) {
 		t.Fatalf("length %d, want %d — the oversized block must be dropped whole", got, inetBlock)
 	}
 }
+
+// A write that fails must surface: the resume key is announced before the handshake, and a session
+// whose header was half-written would be resumed by nobody and dropped by everybody.
+func TestWriteV2WithTLVReportsAWriteFailure(t *testing.T) {
+	err := WriteV2WithTLV(failingWriter{}, tcpAddr(t, "203.0.113.7:4242"), tcpAddr(t, "198.51.100.1:1488"),
+		ResumeTLV("inst-blue", 7))
+	if err == nil {
+		t.Fatal("a failed write must be reported, not swallowed")
+	}
+	if !strings.Contains(err.Error(), "write proxy header") {
+		t.Fatalf("the error must say what could not be written, got %v", err)
+	}
+}

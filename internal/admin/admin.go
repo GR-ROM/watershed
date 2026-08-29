@@ -134,6 +134,9 @@ type MigrateResponse struct {
 	Considered int `json:"considered"`
 	Moved      int `json:"moved"`
 	Remaining  int `json:"remaining"`
+	// Failed counts clients dropped because the new backend could not be dialled — the one number
+	// here that says a rollout hurt somebody, so it is reported rather than folded into Moved.
+	Failed int `json:"failed"`
 }
 
 func (a *API) runMigration(w http.ResponseWriter, r *http.Request) {
@@ -143,9 +146,10 @@ func (a *API) runMigration(w http.ResponseWriter, r *http.Request) {
 	timeout := durationParam(q.Get("timeout"), DefaultTimeout)
 
 	res := a.srv.Migrate(batch, interval, timeout)
-	a.log.Printf("admin: migrated %d of %d live connection(s), %d left on the old backend",
-		res.Moved, res.Considered, res.Remaining)
-	writeJSON(w, MigrateResponse{Considered: res.Considered, Moved: res.Moved, Remaining: res.Remaining})
+	a.log.Printf("admin: migrated %d of %d live connection(s), %d left on the old backend, %d dropped",
+		res.Moved, res.Considered, res.Remaining, res.Failed)
+	writeJSON(w, MigrateResponse{Considered: res.Considered, Moved: res.Moved,
+		Remaining: res.Remaining, Failed: res.Failed})
 }
 
 func (a *API) authorized(w http.ResponseWriter, r *http.Request) bool {

@@ -20,13 +20,15 @@ import (
 // frameWait bounds how long a migration waits for the client to finish the frame it is in the
 // middle of. A frame is a few kilobytes on a live connection, so this is generous; when it expires
 // the session simply stays where it is, because moving it would hand the new backend half a frame.
-const frameWait = 2 * time.Second
+// A var, not a const, only so a test can shorten it; nothing reassigns it at runtime.
+var frameWait = 2 * time.Second
 
 // exportWait bounds how long the proxy waits for the backend to close after being told there are no
 // more client bytes. A node in handover mode exports the session and closes; one that does not is
 // either not in handover mode or is stuck, and either way the connection must not hang here — the
 // client is waiting on the other end of it.
-const exportWait = 10 * time.Second
+// A var for the same reason as frameWait above.
+var exportWait = 10 * time.Second
 
 // session is one client connection spliced to a backend, with the ability to change backends
 // underneath the client.
@@ -64,6 +66,10 @@ type session struct {
 	// carried holds bytes read from the client after the boundary — they belong to the next backend
 	// and are written there first.
 	carried []byte
+
+	// failures counts moves that ended with the client dropped. Kept on the server rather than
+	// here, because by the time a rollout is counted this session is already out of the registry.
+	failures *atomic.Uint64
 }
 
 // Migrate asks this session to move to the current backend at the next frame boundary. It returns
@@ -119,6 +125,9 @@ func (s *session) spliceUntilMigrationOrEnd() bool {
 	if err := s.redial(); err != nil {
 		s.log.Printf("migrate %s: %v — dropping the connection", s.client.RemoteAddr(), err)
 		metrics.MigrationFailed()
+		if s.failures != nil {
+			s.failures.Add(1)
+		}
 		return false
 	}
 	metrics.Migrated()
@@ -302,6 +311,11 @@ type MigrateResult struct {
 	Considered int
 	Moved      int
 	Remaining  int
+	// Failed counts sessions whose new backend could not be dialled: the client was dropped and
+	// will reconnect. Counted separately because such a session leaves the registry, so it would
+	// otherwise be indistinguishable from one that moved — and a rollout that cut connections must
+	// not report itself as clean.
+	Failed int
 }
 
 // Migrate moves every session still on an older backend to the current one, in batches, and waits
@@ -320,6 +334,7 @@ func (s *Server) Migrate(batch int, interval, timeout time.Duration) MigrateResu
 		batch = len(pending)
 	}
 
+	failuresBefore := s.migrationFailures.Load()
 	deadline := time.Now().Add(timeout)
 	for i := 0; i < len(pending); i += batch {
 		end := i + batch
@@ -345,6 +360,10 @@ func (s *Server) Migrate(batch int, interval, timeout time.Duration) MigrateResu
 	}
 
 	res.Remaining = len(s.sessions.stale(current.Generation))
-	res.Moved = res.Considered - res.Remaining
+	res.Failed = int(s.migrationFailures.Load() - failuresBefore)
+	res.Moved = res.Considered - res.Remaining - res.Failed
+	if res.Moved < 0 {
+		res.Moved = 0 // a failure from an earlier pass landing in this window
+	}
 	return res
 }
