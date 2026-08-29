@@ -3,9 +3,9 @@ package proxy
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"log"
 	"net"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -105,7 +105,7 @@ func serverFor(t *testing.T, addr string) *Server {
 		HTTPBackend:     be,
 		Backends:        map[string]config.Backend{config.DefaultTCPBackendName: be, config.DefaultHTTPBackendName: be},
 	}
-	srv, err := New(cfg, log.New(os.Stderr, "test ", 0))
+	srv, err := New(cfg, log.New(io.Discard, "", 0))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
