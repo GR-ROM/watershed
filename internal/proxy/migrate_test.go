@@ -3,9 +3,9 @@ package proxy
 import (
 	"bytes"
 	"encoding/binary"
-	"os"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
