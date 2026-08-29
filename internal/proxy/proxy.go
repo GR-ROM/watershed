@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"watershed/internal/backend"
 	"watershed/internal/config"
 	"watershed/internal/dialer"
 	"watershed/internal/inspector"
@@ -30,6 +31,11 @@ type Server struct {
 	cfg    *config.Config
 	log    *log.Logger
 	router *router.Router
+
+	// backends holds the current TCP target, which a rolling update replaces at runtime; sessions
+	// tracks the connections that can be moved when it does.
+	backends *backend.Holder
+	sessions *registry
 
 	mu      sync.Mutex
 	conns   map[net.Conn]struct{}
@@ -57,12 +63,20 @@ func New(cfg *config.Config, logger *log.Logger) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:    cfg,
-		log:    logger,
-		router: rt,
-		conns:  make(map[net.Conn]struct{}),
+		cfg:      cfg,
+		log:      logger,
+		router:   rt,
+		backends: backend.NewHolder(cfg.TCPBackend, ""),
+		sessions: newRegistry(),
+		conns:    make(map[net.Conn]struct{}),
 	}, nil
 }
+
+// Backends exposes the current-target holder so the admin API can point the proxy elsewhere.
+func (s *Server) Backends() *backend.Holder { return s.backends }
+
+// MigratableSessions is how many live connections could be moved to a new backend.
+func (s *Server) MigratableSessions() int { return s.sessions.size() }
 
 // Serve accepts connections until ln is closed. It always returns a non-nil
 // error; after Shutdown that error is net.ErrClosed.
@@ -109,9 +123,9 @@ func (s *Server) handle(client net.Conn) {
 	}
 	metrics.Inspected(time.Since(inspectStart))
 
-	name, backend := s.pick(res)
+	name, target, migratable := s.pick(res)
 
-	upstream, err := dialer.Dial(backend, s.cfg.DialTimeout, client.RemoteAddr(), client.LocalAddr())
+	upstream, err := dialer.Dial(target.Backend, s.cfg.DialTimeout, client.RemoteAddr(), client.LocalAddr())
 	if err != nil {
 		metrics.DialFailed()
 		s.log.Printf("route %s -> %s (%s): %v", client.RemoteAddr(), name, res.Protocol, err)
@@ -121,18 +135,46 @@ func (s *Server) handle(client net.Conn) {
 	metrics.Routed(res.Protocol.String())
 
 	s.log.Printf("route %s -> %s %s (%s/%s)",
-		client.RemoteAddr(), name, backend.Addr, res.Protocol, backend.Transport)
-	Splice(peeked, upstream)
+		client.RemoteAddr(), name, target.Backend.Addr, res.Protocol, target.Backend.Transport)
+
+	if !migratable {
+		// An HTTP connection to the decoy: short, stateless, and nothing a rollout needs to carry.
+		Splice(peeked, upstream)
+		return
+	}
+
+	sess := &session{
+		client:   peeked,
+		upstream: upstream,
+		cfg:      s.cfg,
+		holder:   s.backends,
+		log:      s.log,
+		connID:   s.sessions.nextConnID(),
+		target:   target,
+	}
+	sess.generation.Store(target.Generation)
+	s.sessions.add(sess)
+	defer s.sessions.remove(sess.connID)
+	sess.run()
+	// The session may have moved to another backend; close whatever it ended on. The deferred
+	// close above still covers the one dialled here.
+	if sess.upstream != upstream {
+		_ = sess.upstream.Close()
+	}
 }
 
-// pick resolves a peek result to a named backend.
+// pick resolves a peek result to a named backend, and says whether the connection can be migrated.
 //
 // Non-HTTP always goes to the TCP backend: rules describe HTTP requests and
 // have nothing to match against a raw stream. For HTTP the rules decide, and
 // the HTTP backend is the fallback when none applies.
-func (s *Server) pick(res inspector.Result) (string, config.Backend) {
+//
+// Only the TCP backend is migratable, and it is read from the holder rather than the config: that
+// is the address a rolling update replaces, and reading it per connection is what makes new
+// connections land on the new instance the moment the switch happens.
+func (s *Server) pick(res inspector.Result) (string, *backend.Target, bool) {
 	if res.Protocol != inspector.ProtocolHTTP || res.Request == nil {
-		return config.DefaultTCPBackendName, s.cfg.TCPBackend
+		return config.DefaultTCPBackendName, s.backends.Current(), true
 	}
 
 	req := router.Request{
@@ -143,13 +185,13 @@ func (s *Server) pick(res inspector.Result) (string, config.Backend) {
 	}
 	if name, ok := s.router.Match(req); ok {
 		if b, exists := s.cfg.Backends[name]; exists {
-			return name, b
+			return name, &backend.Target{Backend: b}, false
 		}
 		// New() rejects unknown backends, so this is unreachable in practice;
 		// falling back beats dropping the connection if it ever happens.
 		s.log.Printf("rule matched unknown backend %q, using the default", name)
 	}
-	return config.DefaultHTTPBackendName, s.cfg.HTTPBackend
+	return config.DefaultHTTPBackendName, &backend.Target{Backend: s.cfg.HTTPBackend}, false
 }
 
 // Splice copies bytes in both directions until either side finishes, then
@@ -229,4 +271,10 @@ func (s *Server) isClosing() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closing
+}
+
+// StaleSessions is how many live connections are still on a backend older than the current one —
+// what a migration would move.
+func (s *Server) StaleSessions() int {
+	return len(s.sessions.stale(s.backends.Current().Generation))
 }

@@ -30,7 +30,20 @@ const (
 
 	inetBlock  = 12 // 4 + 4 + 2 + 2
 	inet6Block = 36 // 16 + 16 + 2 + 2
+
+	// TypeResume is the TLV carrying a handover key: the connection being opened continues one that
+	// another backend instance already knows, and the backend should restore that session instead of
+	// treating the client as a stranger. It sits in the spec's PP2_TYPE_MIN_CUSTOM..MAX_CUSTOM range
+	// (0xE0..0xEF), which exists for exactly this — a receiver that does not know the type skips it,
+	// so a backend built before handover keeps working unchanged.
+	TypeResume = 0xE0
 )
+
+// TLV is one type-length-value block, appended after the address block.
+type TLV struct {
+	Type  byte
+	Value []byte
+}
 
 // WriteV2 writes a header describing a connection from src to dst.
 //
@@ -42,7 +55,16 @@ const (
 // carrying no addresses, which the spec defines as "use the real ones". That keeps a receiver which
 // requires a header from having to decide what a nonsensical one means.
 func WriteV2(w io.Writer, src, dst net.Addr) error {
-	header, err := buildV2(src, dst)
+	return WriteV2WithTLV(w, src, dst)
+}
+
+// WriteV2WithTLV is WriteV2 plus trailing TLV blocks — used to carry a resume key on a connection
+// that continues one from another backend instance (see TypeResume).
+//
+// The blocks go inside the length the header declares, which is what lets a receiver that does not
+// know them skip the lot and still find the first payload byte.
+func WriteV2WithTLV(w io.Writer, src, dst net.Addr, tlvs ...TLV) error {
+	header, err := buildV2(src, dst, tlvs)
 	if err != nil {
 		return err
 	}
@@ -52,44 +74,73 @@ func WriteV2(w io.Writer, src, dst net.Addr) error {
 	return nil
 }
 
-func buildV2(src, dst net.Addr) ([]byte, error) {
+// ResumeTLV builds the handover key: which instance the connection came from and the connection id
+// it had there, as "instanceId:connId" — enough for the new instance to find the exported record,
+// and useless to anyone who did not export it.
+func ResumeTLV(instanceID string, connID uint64) TLV {
+	return TLV{Type: TypeResume, Value: []byte(fmt.Sprintf("%s:%d", instanceID, connID))}
+}
+
+func buildV2(src, dst net.Addr, tlvs []TLV) ([]byte, error) {
+	extra := encodeTLVs(tlvs)
+
 	srcTCP, srcOK := src.(*net.TCPAddr)
 	dstTCP, dstOK := dst.(*net.TCPAddr)
 	if !srcOK || !dstOK {
-		return localHeader(), nil
+		return localHeader(extra), nil
 	}
 
 	src4, dst4 := srcTCP.IP.To4(), dstTCP.IP.To4()
 	if src4 != nil && dst4 != nil {
-		return addressed(familyInetStream, inetBlock, src4, dst4, srcTCP.Port, dstTCP.Port), nil
+		return addressed(familyInetStream, inetBlock, src4, dst4, srcTCP.Port, dstTCP.Port, extra), nil
 	}
 
 	src16, dst16 := srcTCP.IP.To16(), dstTCP.IP.To16()
 	if src16 == nil || dst16 == nil {
 		// An address that is neither v4 nor v6 has nothing to describe.
-		return localHeader(), nil
+		return localHeader(extra), nil
 	}
 	// One end v4 and the other v6 happens on a dual-stack listener, where a v4 client arrives as
 	// ::ffff:a.b.c.d. Both are widened rather than one being narrowed: narrowing would claim a
 	// destination the client never used.
-	return addressed(familyInet6Stream, inet6Block, src16, dst16, srcTCP.Port, dstTCP.Port), nil
+	return addressed(familyInet6Stream, inet6Block, src16, dst16, srcTCP.Port, dstTCP.Port, extra), nil
 }
 
-func addressed(family byte, block int, src, dst net.IP, srcPort, dstPort int) []byte {
-	out := make([]byte, 0, 16+block)
+// encodeTLVs lays each block out as type, 16-bit big-endian length, value. A value too long for that
+// length is dropped rather than truncated: half a resume key is worse than none, because the
+// receiver would look up a record that does not exist and silently treat a resumed client as new.
+func encodeTLVs(tlvs []TLV) []byte {
+	if len(tlvs) == 0 {
+		return nil
+	}
+	var out []byte
+	for _, t := range tlvs {
+		if len(t.Value) > 0xFFFF {
+			continue
+		}
+		out = append(out, t.Type)
+		out = binary.BigEndian.AppendUint16(out, uint16(len(t.Value)))
+		out = append(out, t.Value...)
+	}
+	return out
+}
+
+func addressed(family byte, block int, src, dst net.IP, srcPort, dstPort int, extra []byte) []byte {
+	out := make([]byte, 0, 16+block+len(extra))
 	out = append(out, signature...)
 	out = append(out, versionCommandProxy, family)
-	out = binary.BigEndian.AppendUint16(out, uint16(block))
+	out = binary.BigEndian.AppendUint16(out, uint16(block+len(extra)))
 	out = append(out, src...)
 	out = append(out, dst...)
 	out = binary.BigEndian.AppendUint16(out, uint16(srcPort))
 	out = binary.BigEndian.AppendUint16(out, uint16(dstPort))
-	return out
+	return append(out, extra...)
 }
 
-func localHeader() []byte {
-	out := make([]byte, 0, 16)
+func localHeader(extra []byte) []byte {
+	out := make([]byte, 0, 16+len(extra))
 	out = append(out, signature...)
 	out = append(out, versionCommandLocal, 0x00)
-	return binary.BigEndian.AppendUint16(out, 0)
+	out = binary.BigEndian.AppendUint16(out, uint16(len(extra)))
+	return append(out, extra...)
 }

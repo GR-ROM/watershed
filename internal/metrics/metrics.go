@@ -33,6 +33,10 @@ var (
 
 	proxyHeaders atomic.Uint64
 
+	migrationsOK     atomic.Uint64
+	migrationsFailed atomic.Uint64
+	backendSwitches  atomic.Uint64
+
 	inspectWaitNanos atomic.Uint64
 	inspectCount     atomic.Uint64
 )
@@ -84,6 +88,17 @@ func Downstream(n int64) {
 // ProxyHeaderSent records a PROXY v2 header written to a backend.
 func ProxyHeaderSent() { proxyHeaders.Add(1) }
 
+// Migrated records a live connection carried across to a new backend instance without the client
+// noticing. MigrationFailed is its other half: the client was dropped and has to reconnect, which
+// is the whole thing a rolling update is trying to avoid — so the two are counted separately.
+func Migrated() { migrationsOK.Add(1) }
+
+// MigrationFailed is the other half of Migrated.
+func MigrationFailed() { migrationsFailed.Add(1) }
+
+// BackendSwitched records the proxy being pointed at a different backend address.
+func BackendSwitched() { backendSwitches.Add(1) }
+
 // WriteTo renders every counter in the Prometheus text exposition format.
 func WriteTo(w io.Writer) {
 	p := func(format string, args ...any) {
@@ -112,6 +127,15 @@ func WriteTo(w io.Writer) {
 	p("# HELP watershed_proxy_headers_total PROXY v2 headers announced to a backend.\n")
 	p("# TYPE watershed_proxy_headers_total counter\n")
 	p("watershed_proxy_headers_total %d\n", proxyHeaders.Load())
+
+	p("# HELP watershed_migrations_total Live connections moved to another backend instance, by outcome.\n")
+	p("# TYPE watershed_migrations_total counter\n")
+	p("watershed_migrations_total{result=\"ok\"} %d\n", migrationsOK.Load())
+	p("watershed_migrations_total{result=\"failed\"} %d\n", migrationsFailed.Load())
+
+	p("# HELP watershed_backend_switches_total Times the TCP backend address was replaced at runtime.\n")
+	p("# TYPE watershed_backend_switches_total counter\n")
+	p("watershed_backend_switches_total %d\n", backendSwitches.Load())
 
 	// A sum and a count rather than a histogram: the question is "is classification instant or is it
 	// waiting for the deadline", and a mean answers it. Buckets can come the day it does not.

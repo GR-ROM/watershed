@@ -16,6 +16,7 @@ import (
 
 	"net/http"
 
+	"watershed/internal/admin"
 	"watershed/internal/config"
 	"watershed/internal/metrics"
 	"watershed/internal/proxy"
@@ -46,21 +47,30 @@ func main() {
 //
 // A failure to bind is logged and not fatal. Losing metrics is worth a line in the log; taking the
 // proxy down over them is not, and this process is in the path of every client.
-func startMetrics(addr string, logger *log.Logger) {
+func startMetrics(addr string, srv *proxy.Server, logger *log.Logger) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		metrics.WriteTo(w)
 	})
 
-	srv := &http.Server{
+	// The rolling-update surface lives here rather than on its own port: it belongs to the same
+	// private network as the metrics, and one listener is one thing to keep off the internet.
+	// ADMIN_TOKEN empty leaves every state-changing endpoint refusing, which is the safe default
+	// for a process in the path of every client.
+	admin.New(srv, os.Getenv("ADMIN_TOKEN"), logger).Register(mux)
+	if os.Getenv("ADMIN_TOKEN") == "" {
+		logger.Printf("admin API is read-only: ADMIN_TOKEN is not set")
+	}
+
+	httpSrv := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		logger.Printf("metrics on %s/metrics", addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Printf("metrics on %s/metrics, admin on %s/admin/*", addr, addr)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Printf("metrics listener stopped: %v", err)
 		}
 	}()
@@ -109,8 +119,13 @@ func run(logger *log.Logger) error {
 		return err
 	}
 
+	// The instance behind the TCP backend, as the control plane knows it. It travels in the resume
+	// key of a handover, so the new instance can tell "a connection the previous one exported" from
+	// "someone else's". Empty until the first switch names one.
+	srv.Backends().Switch(cfg.TCPBackend.Addr, os.Getenv("BACKEND_TCP_INSTANCE"))
+
 	if addr := os.Getenv("METRICS_LISTEN_ADDR"); addr != "" {
-		startMetrics(addr, logger)
+		startMetrics(addr, srv, logger)
 	}
 
 	logger.Printf("listening on %s", ln.Addr())

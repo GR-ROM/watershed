@@ -20,6 +20,15 @@ import (
 // connected, and the address they connected to. They are only used when the backend asks for a PROXY
 // header; pass nil for both when there is nothing to announce.
 func Dial(b config.Backend, timeout time.Duration, client, dialled net.Addr) (net.Conn, error) {
+	return DialResuming(b, timeout, client, dialled)
+}
+
+// DialResuming is Dial plus extra PROXY TLV blocks — in practice the resume key of a connection
+// being carried over from another backend instance. The keys ride in the PROXY header, so a backend
+// that does not ask for one cannot be handed over to; that is a property of the deployment, not a
+// silent failure here.
+func DialResuming(b config.Backend, timeout time.Duration, client, dialled net.Addr,
+	tlvs ...proxyproto.TLV) (net.Conn, error) {
 	d := &net.Dialer{Timeout: timeout}
 
 	if b.Transport != config.TransportPlain && b.Transport != config.TransportTLS {
@@ -34,7 +43,7 @@ func Dial(b config.Backend, timeout time.Duration, client, dialled net.Addr) (ne
 	// Before the handshake, not after. The receiver reads it off the raw socket to decide whether
 	// this client is welcome, which it has to know before spending a handshake on them.
 	if b.SendProxy {
-		if err := proxyproto.WriteV2(raw, client, dialled); err != nil {
+		if err := proxyproto.WriteV2WithTLV(raw, client, dialled, tlvs...); err != nil {
 			raw.Close()
 			return nil, fmt.Errorf("announce %s: %w", b.Addr, err)
 		}
