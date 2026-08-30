@@ -16,6 +16,7 @@ import (
 	"watershed/internal/dialer"
 	"watershed/internal/inspector"
 	"watershed/internal/metrics"
+	"watershed/internal/proxyproto"
 	"watershed/internal/router"
 )
 
@@ -128,7 +129,18 @@ func (s *Server) handle(client net.Conn) {
 
 	name, target, migratable := s.pick(res)
 
-	upstream, err := dialer.Dial(target.Backend, s.cfg.DialTimeout, client.RemoteAddr(), client.LocalAddr())
+	// The id is minted before the dial, not with the session: it goes to the backend in the PROXY
+	// header so the node knows what this connection is called on this side, and can file an exported
+	// session under a name the proxy will actually ask for.
+	var tlvs []proxyproto.TLV
+	var connID uint64
+	if migratable {
+		connID = s.sessions.nextConnID()
+		tlvs = append(tlvs, proxyproto.ResumeTLV("", connID))
+	}
+
+	upstream, err := dialer.DialResuming(target.Backend, s.cfg.DialTimeout, client.RemoteAddr(),
+		client.LocalAddr(), tlvs...)
 	if err != nil {
 		metrics.DialFailed()
 		s.log.Printf("route %s -> %s (%s): %v", client.RemoteAddr(), name, res.Protocol, err)
@@ -152,7 +164,7 @@ func (s *Server) handle(client net.Conn) {
 		cfg:      s.cfg,
 		holder:   s.backends,
 		log:      s.log,
-		connID:   s.sessions.nextConnID(),
+		connID:   connID,
 		target:   target,
 		failures: &s.migrationFailures,
 	}

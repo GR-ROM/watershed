@@ -40,6 +40,20 @@ func (c *stubConn) size() int {
 	return c.received.Len()
 }
 
+// payload is what the backend received after the PROXY header. The header's length is declared
+// inside it (bytes 14..15), and the tests must read that rather than assume a size: the TLV naming
+// the connection makes the header longer, and a hardcoded offset silently shifts every assertion.
+func payload(b []byte) []byte {
+	if len(b) < 16 {
+		return nil
+	}
+	end := 16 + int(binary.BigEndian.Uint16(b[14:16]))
+	if len(b) < end {
+		return nil
+	}
+	return b[end:]
+}
+
 func newBackendStub(t *testing.T) *backendStub {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -189,7 +203,7 @@ func TestMigrationMovesALiveConnectionWithoutDroppingTheClient(t *testing.T) {
 		t.Fatalf("client write: %v", err)
 	}
 	blueConn := blue.next(t)
-	waitFor(t, "the first frame to reach blue", func() bool { return blueConn.size() >= 16+12+4+8 })
+	waitFor(t, "the first frame to reach blue", func() bool { return len(payload(blueConn.bytes())) >= 4+8 })
 
 	srv.backends.Switch(green.addr(), "instance-green")
 	res := srv.Migrate(10, 0, 3*time.Second)
@@ -244,7 +258,7 @@ func TestAFrameInFlightFinishesOnTheOldBackendAndTheNextIsCarried(t *testing.T) 
 	}
 	blueConn := blue.next(t)
 	waitFor(t, "blue to get the first frame and the head of the second", func() bool {
-		return blueConn.size() >= 16+12+len(first)+10
+		return len(payload(blueConn.bytes())) >= len(first)+10
 	})
 
 	// Ask to move while that frame is still open, then let the client finish it and start another.
@@ -275,8 +289,7 @@ func TestAFrameInFlightFinishesOnTheOldBackendAndTheNextIsCarried(t *testing.T) 
 	})
 
 	// Blue got both complete frames and nothing of the third.
-	const headerLen = 16 + 12 // signature block + IPv4 addresses
-	bluePayload := blueConn.bytes()[headerLen:]
+	bluePayload := payload(blueConn.bytes())
 	wantBlue := append(append([]byte{}, first...), inFlight...)
 	if !bytes.Equal(bluePayload, wantBlue) {
 		t.Fatalf("blue received %d payload bytes, want %d — the frame in flight must finish where it started",
@@ -307,7 +320,7 @@ func TestASessionStuckMidFrameStaysPut(t *testing.T) {
 		t.Fatalf("client write: %v", err)
 	}
 	blueConn := blue.next(t)
-	waitFor(t, "blue to get the fragment", func() bool { return blueConn.size() >= 16+12+len(half) })
+	waitFor(t, "blue to get the fragment", func() bool { return len(payload(blueConn.bytes())) >= len(half) })
 
 	srv.backends.Switch(green.addr(), "instance-green")
 	res := srv.Migrate(10, 0, frameWait+2*time.Second)
@@ -345,7 +358,7 @@ func TestNewConnectionsGoToTheCurrentBackend(t *testing.T) {
 	}
 
 	greenConn := green.next(t)
-	waitFor(t, "green to receive the frame", func() bool { return greenConn.size() >= 16+12+4+2 })
+	waitFor(t, "green to receive the frame", func() bool { return len(payload(greenConn.bytes())) >= 4+2 })
 	select {
 	case <-blue.accepted:
 		t.Fatal("a connection opened after the switch must not reach the old backend")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -97,7 +98,7 @@ func TestABackendThatNeverClosesIsForcedAfterTheExportWait(t *testing.T) {
 	if _, err := client.Write(frame(32)); err != nil {
 		t.Fatalf("client write: %v", err)
 	}
-	waitFor(t, "the stuck backend to get the frame", func() bool { return stuck.size() >= 16+12+4+32 })
+	waitFor(t, "the stuck backend to get the frame", func() bool { return len(payload(stuck.bytes())) >= 4+32 })
 
 	srv.backends.Switch(green.addr(), "instance-green")
 	start := time.Now()
@@ -170,6 +171,12 @@ func newSilentBackend(t *testing.T) *silentBackend {
 
 func (b *silentBackend) addr() string { return b.ln.Addr().String() }
 
+func (b *silentBackend) bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte{}, b.received.Bytes()...)
+}
+
 func (b *silentBackend) size() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -188,7 +195,7 @@ func TestAMigrationToAnUndialableBackendLeavesTheSessionPut(t *testing.T) {
 		t.Fatalf("client write: %v", err)
 	}
 	blueConn := blue.next(t)
-	waitFor(t, "blue to get the frame", func() bool { return blueConn.size() >= 16+12+4+32 })
+	waitFor(t, "blue to get the frame", func() bool { return len(payload(blueConn.bytes())) >= 4+32 })
 
 	// Nothing listens here.
 	dead, err := net.Listen("tcp", "127.0.0.1:0")
@@ -225,7 +232,7 @@ func TestMigrateBatchingAndDeadline(t *testing.T) {
 	}
 	for range clients {
 		conn := blue.next(t)
-		waitFor(t, "blue to get the frame", func() bool { return conn.size() >= 16+12+4+16 })
+		waitFor(t, "blue to get the frame", func() bool { return len(payload(conn.bytes())) >= 4+16 })
 	}
 
 	// A deadline that has already passed stops the pass after the first batch — the batch is
@@ -244,5 +251,45 @@ func TestMigrateBatchingAndDeadline(t *testing.T) {
 	// And a pass with nothing left to do is cheap and honest.
 	if again := srv.Migrate(10, 0, time.Second); again.Considered != 0 || again.Moved != 0 {
 		t.Fatalf("a second pass = %+v, want nothing considered", again)
+	}
+}
+
+// The node has to be told what this connection is called on the proxy's side, on the FIRST dial —
+// otherwise it files an exported session under its own connection counter, the proxy later asks for
+// its own, and nothing ever matches. That is what happened on node-1 (2026-08-30): the node exported
+// conn 166 while the proxy asked for conn 85, every migration reported success and every client
+// logged in again.
+func TestTheFirstDialNamesTheConnectionToTheBackend(t *testing.T) {
+	blue := newBackendStub(t)
+	green := newBackendStub(t)
+	srv := serverFor(t, blue.addr())
+	srv.backends.Switch(blue.addr(), "instance-blue")
+
+	client := runProxy(t, srv)
+	if _, err := client.Write(frame(16)); err != nil {
+		t.Fatalf("client write: %v", err)
+	}
+	blueConn := blue.next(t)
+	waitFor(t, "blue to get the frame", func() bool { return len(payload(blueConn.bytes())) >= 4+16 })
+
+	first := resumeKey(blueConn.bytes())
+	if first == "" {
+		t.Fatal("the first dial must carry the connection's name, or an export cannot be keyed")
+	}
+	if !strings.HasPrefix(first, ":") {
+		t.Fatalf("resume key %q: a first dial resumes nothing, so it names no source instance", first)
+	}
+
+	// And the re-dial asks for exactly that connection, now qualified by the instance being left.
+	srv.backends.Switch(green.addr(), "instance-green")
+	if res := srv.Migrate(10, 0, 5*time.Second); res.Moved != 1 {
+		t.Fatalf("migrate result = %+v, want the session moved", res)
+	}
+	greenConn := green.next(t)
+	waitFor(t, "green to be dialled", func() bool { return len(greenConn.bytes()) >= 16 })
+
+	want := "instance-blue" + first
+	if got := resumeKey(greenConn.bytes()); got != want {
+		t.Fatalf("resume key on the re-dial = %q, want %q — the same connection, named by its source", got, want)
 	}
 }

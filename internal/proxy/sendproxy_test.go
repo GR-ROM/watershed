@@ -43,7 +43,9 @@ func startHeaderReader(t *testing.T) (addr string, got chan string) {
 			got <- "read error: " + err.Error()
 			return
 		}
-		if fixed[13] != 0x11 || len(block) != 12 {
+		// At least the IPv4 address block; longer is legal and expected — the TLV that names this
+		// connection to the node lives past the addresses, inside the same declared length.
+		if fixed[13] != 0x11 || len(block) < 12 {
 			got <- "unexpected family/length"
 			return
 		}

@@ -74,9 +74,17 @@ func WriteV2WithTLV(w io.Writer, src, dst net.Addr, tlvs ...TLV) error {
 	return nil
 }
 
-// ResumeTLV builds the handover key: which instance the connection came from and the connection id
-// it had there, as "instanceId:connId" — enough for the new instance to find the exported record,
-// and useless to anyone who did not export it.
+// ResumeTLV names a connection to the backend, as "instanceId:connId".
+//
+// The connection id is the PROXY's, not the node's, and that is the whole point: the proxy is the
+// party that presents the key later, so it has to be the party that owns the name. The node learns
+// its proxy-side id from this TLV at accept and files its exported session under it. Two counters,
+// one on each side, was the first attempt — the node exported conn 166 while the proxy asked for
+// conn 85, and nothing ever matched (node-1, 2026-08-30).
+//
+// instanceID is empty on a first dial: there is nothing to resume, and the TLV is there only to
+// tell the node what this connection is called. On a re-dial it names the instance being left, and
+// the node taking over looks that key up in the exported file.
 func ResumeTLV(instanceID string, connID uint64) TLV {
 	return TLV{Type: TypeResume, Value: []byte(fmt.Sprintf("%s:%d", instanceID, connID))}
 }
