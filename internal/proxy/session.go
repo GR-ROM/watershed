@@ -101,7 +101,17 @@ func (s *session) spliceUntilMigrationOrEnd() bool {
 
 	go func() {
 		defer close(downstreamDone)
-		metrics.Downstream(copyThenHalfClose(s.client, s.upstream))
+		n, _ := io.Copy(s.client, s.upstream)
+		metrics.Downstream(n)
+		// The backend closing means one of two very different things. On an ordinary end of life it
+		// is the conversation finishing, and the client is told so. During a handover it is the old
+		// instance saying "written down, go ahead" — and telling the client the same thing would end
+		// the very tunnel the handover exists to preserve. It would look like success from every
+		// other angle: the session moves, the new instance restores it, and the client reconnects
+		// anyway because its read side was shut in the same breath.
+		if !s.migrateWanted.Load() {
+			halfClose(s.client)
+		}
 	}()
 	go func() { upstreamDone <- s.copyUpstream() }()
 

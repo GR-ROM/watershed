@@ -232,20 +232,28 @@ func Splice(a, b net.Conn) {
 // goroutine instead of leaking it.
 func copyThenHalfClose(dst, src net.Conn) int64 {
 	n, _ := io.Copy(dst, src)
+	halfClose(dst)
+	return n
+}
 
+// halfClose tells the other end there is nothing more coming from this side.
+//
+// Only ever on an ordinary end of life. During a handover the backend closing is the signal that it
+// has written the session down, not that the conversation is over — telling the client the same
+// thing would end the tunnel the handover exists to preserve.
+func halfClose(dst net.Conn) {
 	if hc, ok := dst.(halfCloser); ok {
 		_ = hc.CloseWrite()
-		return n
+		return
 	}
 	// inspector.Conn wraps the real connection; unwrap one level before giving up.
 	if ic, ok := dst.(*inspector.Conn); ok {
 		if hc, ok := ic.Conn.(halfCloser); ok {
 			_ = hc.CloseWrite()
-			return n
+			return
 		}
 	}
 	_ = dst.Close()
-	return n
 }
 
 // Shutdown stops accepting, closes live connections and waits for the handlers
