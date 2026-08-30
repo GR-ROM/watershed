@@ -10,34 +10,85 @@ import (
 	"time"
 
 	"watershed/internal/config"
+	"watershed/internal/metrics"
+	"watershed/internal/proxyproto"
 )
 
 // Dial connects to b, honouring its transport and TLS material.
-func Dial(b config.Backend, timeout time.Duration) (net.Conn, error) {
+//
+// client and dialled describe the connection being proxied, from the client's point of view: who
+// connected, and the address they connected to. They are only used when the backend asks for a PROXY
+// header; pass nil for both when there is nothing to announce.
+func Dial(b config.Backend, timeout time.Duration, client, dialled net.Addr) (net.Conn, error) {
+	return DialResuming(b, timeout, client, dialled)
+}
+
+// DialResuming is Dial plus extra PROXY TLV blocks — in practice the resume key of a connection
+// being carried over from another backend instance. The keys ride in the PROXY header, so a backend
+// that does not ask for one cannot be handed over to; that is a property of the deployment, not a
+// silent failure here.
+func DialResuming(b config.Backend, timeout time.Duration, client, dialled net.Addr,
+	tlvs ...proxyproto.TLV) (net.Conn, error) {
 	d := &net.Dialer{Timeout: timeout}
 
-	switch b.Transport {
-	case config.TransportPlain:
-		conn, err := d.Dial("tcp", b.Addr)
-		if err != nil {
-			return nil, fmt.Errorf("dial %s: %w", b.Addr, err)
-		}
-		return conn, nil
-
-	case config.TransportTLS:
-		cfg, err := TLSConfig(b)
-		if err != nil {
-			return nil, err
-		}
-		conn, err := tls.DialWithDialer(d, "tcp", b.Addr, cfg)
-		if err != nil {
-			return nil, fmt.Errorf("tls dial %s: %w", b.Addr, err)
-		}
-		return conn, nil
-
-	default:
+	if b.Transport != config.TransportPlain && b.Transport != config.TransportTLS {
 		return nil, fmt.Errorf("unsupported transport %q", b.Transport)
 	}
+
+	raw, err := d.Dial("tcp", b.Addr)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", b.Addr, err)
+	}
+
+	// Before the handshake, not after. The receiver reads it off the raw socket to decide whether
+	// this client is welcome, which it has to know before spending a handshake on them.
+	if b.SendProxy {
+		if err := proxyproto.WriteV2WithTLV(raw, client, dialled, tlvs...); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("announce %s: %w", b.Addr, err)
+		}
+		metrics.ProxyHeaderSent()
+	}
+
+	if b.Transport == config.TransportPlain {
+		return raw, nil
+	}
+
+	cfg, err := TLSConfig(b)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	// tls.DialWithDialer used to fill ServerName in from the dial address, including for an IP
+	// literal, and TLSConfig leaves it empty on purpose for exactly that reason. Doing the handshake
+	// by hand means doing that too, or an IP-addressed backend fails with "either ServerName or
+	// InsecureSkipVerify must be specified" -- which is the shape of every backend here.
+	if cfg.ServerName == "" && !cfg.InsecureSkipVerify {
+		if host, _, splitErr := net.SplitHostPort(b.Addr); splitErr == nil {
+			cfg.ServerName = host
+		}
+	}
+	conn := tls.Client(raw, cfg)
+	// tls.DialWithDialer bounded the handshake with the same timeout as the dial; doing it by hand
+	// means bounding it by hand, or a backend that accepts and then says nothing holds this
+	// goroutine and its two sockets forever.
+	if timeout > 0 {
+		if err := raw.SetDeadline(time.Now().Add(timeout)); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("tls dial %s: %w", b.Addr, err)
+		}
+	}
+	if err := conn.Handshake(); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("tls dial %s: %w", b.Addr, err)
+	}
+	if timeout > 0 {
+		if err := raw.SetDeadline(time.Time{}); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("tls dial %s: %w", b.Addr, err)
+		}
+	}
+	return conn, nil
 }
 
 // TLSConfig builds the client-side tls.Config for a backend: a trust anchor

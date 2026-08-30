@@ -28,7 +28,15 @@ The peek is bounded two ways. `MAX_INSPECT_BYTES` caps how much is buffered, and
 `INSPECT_TIMEOUT` caps how long watershed waits for it. Crucially the proxy does
 **not** wait for the buffer to fill: a 40-byte request is classified as soon as
 it arrives, so a client that sends a short request and waits for a reply is
-never stalled. For HTTP the peek continues to the end of the header block — no
+never stalled.
+
+That holds for binary protocols too, and used to not: until 2026-08-23 the
+classifier only ran once a newline appeared in the buffer, so a stream that
+never sends one was held until `INSPECT_TIMEOUT` fired. Every non-HTTP
+connection paid it in full -- measured through a real proxy at 5266 ms to the
+first protocol reply against 614 ms direct. A prefix that cannot still become an
+HTTP request line is now decided on the spot, which for a binary protocol is
+usually the first byte. For HTTP the peek continues to the end of the header block — no
 further — so rules can match on headers while the body still streams straight
 through. Every peeked byte is replayed to the backend verbatim.
 
@@ -54,6 +62,61 @@ All settings come from the environment.
 | `TLS_CERT_FILE` | — | **Required.** Server certificate presented to clients |
 | `TLS_KEY_FILE` | — | **Required.** Matching private key |
 
+### Observability
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `METRICS_LISTEN_ADDR` | — | Serves Prometheus metrics at `/metrics` **and the admin API at `/admin/*`** on this address; unset means neither |
+| `ADMIN_TOKEN` | — | Secret for the state-changing admin endpoints (`X-Admin-Token`). Empty leaves them refusing with 403 — `/admin/status` stays readable |
+| `BACKEND_TCP_INSTANCE` | — | Which node instance is behind `BACKEND_TCP_ADDR`, as the control plane names it. Travels in a handover's resume key |
+
+**Do not make it public.** The proxy's job is to look like an ordinary web server from outside, and an
+endpoint answering `watershed_connections_total` undoes that in one request. Bind it to loopback or a
+private network and let the scraper reach it there. A failure to bind is logged and not fatal: losing
+metrics is worth a line in the log, taking down a proxy that every client goes through is not.
+
+Two of the series are worth knowing about. `watershed_inspect_wait_seconds_total` over
+`watershed_inspect_total` is the mean time to classify a connection — a bug once held every non-HTTP
+connection for the whole `INSPECT_TIMEOUT` and the only symptom was that clients felt slow; this ratio
+says it in one glance. And `watershed_connection_errors_total` is split by stage, because "the proxy
+is failing" is not actionable while "it cannot dial the backend" is.
+
+## Rolling a backend without dropping anyone
+
+The TCP backend can be replaced while the proxy runs, and live connections carried across to the new
+instance. That is what makes a node update invisible: the client's TLS session is to this proxy, and
+this proxy never lets go of it.
+
+```bash
+# 1. Point new connections at the new instance. Live ones stay where they are.
+curl -XPOST -H "X-Admin-Token: $T" "$ADMIN/admin/backend?addr=172.30.0.11:1488&instance=inst-green"
+
+# 2. Watch, then move the live ones across in batches.
+curl -XPOST -H "X-Admin-Token: $T" "$ADMIN/admin/migrate?batch=10&interval=200ms&timeout=60s"
+# {"considered":37,"moved":37,"remaining":0}
+
+curl "$ADMIN/admin/status"
+# {"backend":"172.30.0.11:1488","instanceId":"inst-green","generation":2,"sessions":37,"stale":0}
+```
+
+**How a connection moves.** Only the proxy can stop the client→backend direction somewhere safe, so
+it does. It counts frames (the backend protocol is a 4-byte big-endian length, then that many
+bytes), stops on a boundary, and half-closes the backend socket. The node reads that end-of-stream
+as "no more client bytes are coming": it exports the session, flushes what it still owes the client,
+and closes. Only then does the proxy dial the new instance, with the old instance's id and the
+connection id in a PROXY v2 TLV (`0xE0`, `instanceId:connId`) so the new one restores that session
+instead of seeing a stranger. Bytes that arrived after the boundary are carried across and written
+there first, so a frame split by the move is reassembled whole.
+
+Two things it will not do. A client that goes quiet **mid-frame** is left where it is — moving it
+would hand one backend half a frame, and half a frame reads as a nonsense length and drops the
+tunnel; `remaining` in the response counts those, and asking again usually moves them. And a backend
+that never closes after the half-close is force-closed after ten seconds: losing one connection
+beats hanging it forever.
+
+HTTP connections (the decoy) are not tracked or migrated. They are short and stateless, and a
+rollout has nothing to carry.
+
 ### Inspection and timeouts
 
 | Variable | Default | Meaning |
@@ -75,6 +138,12 @@ for everything else. Both accept the same variables.
 | `BACKEND_<X>_CLIENT_CERT_FILE` | — | Client certificate for mTLS |
 | `BACKEND_<X>_CLIENT_KEY_FILE` | — | Matching key; must be set together with the cert |
 | `BACKEND_<X>_TLS_INSECURE_SKIP_VERIFY` | `false` | Skip verification — development only |
+| `BACKEND_<X>_SEND_PROXY` | — | `v2` prepends a PROXY protocol v2 header so the backend learns the client's real address |
+
+`SEND_PROXY` is written on the raw TCP connection **before** any TLS handshake, because that is where
+a receiver has to read it: it decides whether to talk to this client at all before spending a
+handshake on them. A backend that does not expect a header will refuse the connection — read as a
+frame length the signature is 218 762 506 — so it is opt-in per backend and off by default.
 
 TLS-only variables are ignored when `TYPE=plain`, so a half-edited environment
 cannot silently change transports. Any invalid value is reported as a startup

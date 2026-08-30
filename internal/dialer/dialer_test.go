@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,7 +73,7 @@ func TestDialPlain(t *testing.T) {
 		}
 	}()
 
-	conn, err := Dial(config.Backend{Transport: config.TransportPlain, Addr: ln.Addr().String()}, time.Second)
+	conn, err := Dial(config.Backend{Transport: config.TransportPlain, Addr: ln.Addr().String()}, time.Second, nil, nil)
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -118,7 +119,7 @@ func TestDialTLSVerifiesAgainstCABundle(t *testing.T) {
 			Transport:  config.TransportTLS,
 			Addr:       ln.Addr().String(),
 			CACertFile: certPath,
-		}, 2*time.Second)
+		}, 2*time.Second, nil, nil)
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}
@@ -137,7 +138,7 @@ func TestDialTLSVerifiesAgainstCABundle(t *testing.T) {
 		_, err := Dial(config.Backend{
 			Transport: config.TransportTLS,
 			Addr:      ln.Addr().String(),
-		}, 2*time.Second)
+		}, 2*time.Second, nil, nil)
 		if err == nil {
 			t.Fatal("expected verification to fail without the CA bundle")
 		}
@@ -148,7 +149,7 @@ func TestDialTLSVerifiesAgainstCABundle(t *testing.T) {
 			Transport:          config.TransportTLS,
 			Addr:               ln.Addr().String(),
 			InsecureSkipVerify: true,
-		}, 2*time.Second)
+		}, 2*time.Second, nil, nil)
 		if err != nil {
 			t.Fatalf("Dial: %v", err)
 		}
@@ -202,7 +203,62 @@ func TestTLSConfigErrors(t *testing.T) {
 }
 
 func TestDialUnsupportedTransport(t *testing.T) {
-	if _, err := Dial(config.Backend{Transport: "quic", Addr: "127.0.0.1:1"}, time.Second); err == nil {
+	if _, err := Dial(config.Backend{Transport: "quic", Addr: "127.0.0.1:1"}, time.Second, nil, nil); err == nil {
 		t.Fatal("expected an error for an unsupported transport")
+	}
+}
+
+func TestDialResumingRefusesAnUnknownTransport(t *testing.T) {
+	// A backend the config parser did not vet must fail before a socket is opened, not after.
+	_, err := DialResuming(config.Backend{Transport: "carrier-pigeon", Addr: "127.0.0.1:1"},
+		time.Second, nil, nil)
+	if err == nil {
+		t.Fatal("an unsupported transport must not dial")
+	}
+	if !strings.Contains(err.Error(), "carrier-pigeon") {
+		t.Fatalf("the error must name the transport, got %v", err)
+	}
+}
+
+func TestDialResumingReportsAnUnreachableBackend(t *testing.T) {
+	// Nothing listens here: a failed re-dial mid-rollout has to surface, or the session is silently
+	// left on the instance that is about to stop.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+
+	if _, err := DialResuming(config.Backend{Transport: config.TransportPlain, Addr: addr},
+		200*time.Millisecond, nil, nil); err == nil {
+		t.Fatal("dialling a closed port must fail")
+	}
+}
+
+func TestDialResumingBoundsATlsBackendThatNeverAnswers(t *testing.T) {
+	// A backend that accepts and then says nothing used to hold the goroutine and both sockets for
+	// ever; the handshake deadline is what stops one dead backend from leaking the whole rollout.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	go func() {
+		c, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			time.Sleep(2 * time.Second)
+			c.Close()
+		}
+	}()
+
+	start := time.Now()
+	_, err = DialResuming(config.Backend{Transport: config.TransportTLS, Addr: ln.Addr().String(),
+		InsecureSkipVerify: true}, 150*time.Millisecond, nil, nil)
+	if err == nil {
+		t.Fatal("a silent TLS backend must not hang the dial")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("the handshake was not bounded: took %s", elapsed)
 	}
 }
